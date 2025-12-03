@@ -6,6 +6,12 @@ register(
      # max_episode_steps=100,
 )
 
+register(
+     id="HandoverEnv",
+     entry_point="environments.ho_env:HandoverEnv",
+     # max_episode_steps=100,
+)
+
 
 register(
      id="EnergySavingEnv",

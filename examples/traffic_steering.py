@@ -1,3 +1,6 @@
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 import argparse
 import json
 from gymnasium.utils.env_checker import check_env
@@ -12,7 +15,7 @@ if __name__ == '__main__':
                         help="Path to the configuration file")
     parser.add_argument("--output_folder", type=str, default="output",
                         help="Path to the output folder")
-    parser.add_argument("--ns3_path", type=str, default="/workspace/ns3-mmwave-oran",
+    parser.add_argument("--ns3_path", type=str, default="/home/ubadmin/ns3-mmwave-oran",
                         help="Path to the ns-3 mmWave O-RAN environment")
     parser.add_argument("--num_steps", type=int, default=1000,
                         help="Number of steps to run in the environment")

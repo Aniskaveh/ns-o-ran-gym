@@ -4,7 +4,7 @@
   "rlcAmEnabled": [ 1 ],
   "ues": [2],
   "e2nrEnabled": [1],
-  "simTime": [ 0.7 ],
+  "simTime": [ 2.0],
   "indicationPeriodicity": [0.1],
   "hoSinrDifference": [ 5 ],
   "dataRate": [ 0 ],
