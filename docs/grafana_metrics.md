@@ -81,5 +81,34 @@ ORDER BY step;
 3. Set visualization to **Time series**, with `step` on the X-axis and the metric you’re plotting on Y.
 4. In the dashboard toolbar, set the refresh interval (e.g. `5s`) so the panel re-queries while the run is in progress.
 
-> Note: every `env.reset()` or new run creates a new output UUID. Update the data source path to point Grafana at the latest `/output/<run-id>/database.db`.
+---
+
+## Aggregate every run into one database (recommended)
+
+Instead of re-pointing Grafana to each new UUID folder, run the aggregator while training. It copies the per-run metrics into a single SQLite file (`output/grafana_metrics.db`) that Grafana follows forever.
+
+### 6. Start the aggregator alongside training
+
+```bash
+cd /home/ubadmin/ns-o-ran-gym
+python scripts/metrics_aggregator.py \
+  --output-root /home/ubadmin/ns-o-ran-gym/output \
+  --central-db /home/ubadmin/ns-o-ran-gym/output/grafana_metrics.db \
+  --poll-interval 2
+```
+
+Leave this terminal running; it scans every UUID folder, reads `ho_reward_metrics` and `ho_training_metrics`, and mirrors them into the central database with an extra `run_id` column.
+
+### 7. Point Grafana at the aggregated DB
+
+Reuse steps 3–5 above, but set the SQLite *Path* to `/home/ubadmin/ns-o-ran-gym/output/grafana_metrics.db`. All dashboards now stay connected even when new runs appear, and you can filter per `run_id` in your SQL queries, e.g.:
+
+```sql
+SELECT timestamp, reward
+FROM dqn_reward_metrics
+WHERE run_id = '${run_id}'
+ORDER BY step;
+```
+
+To show every run on the same panel, drop the `WHERE` clause and use Grafana's legend/transform features.
 

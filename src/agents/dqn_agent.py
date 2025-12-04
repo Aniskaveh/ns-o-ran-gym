@@ -288,12 +288,14 @@ class DQNAgent:
         if np.random.rand() < use_epsilon:
             # Random exploration: sample from action space
             action = self.action_space.sample()
+            print(f'Exploration')
         else:
             # Exploitation: use Q-network to select best action
             # Convert observation to tensor and add batch dimension
             # .unsqueeze(0) adds dimension at position 0: [obs_dim] -> [1, obs_dim]
             # PyTorch networks expect batch dimension (like TensorFlow)
             obs_tensor = self._torchify(obs_vector, torch.float32).unsqueeze(0)
+            print(f'Exploitation')
             # torch.no_grad(): disable gradient computation (faster, saves memory)
             # We don't need gradients for inference, only for training
             with torch.no_grad():
