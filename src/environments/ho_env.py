@@ -1,7 +1,10 @@
 from typing_extensions import override
+from typing import Dict, Tuple
 from nsoran.ns_env import NsOranEnv
 from gymnasium import spaces
 import logging
+import os
+import re
 
 import numpy as np
 
@@ -90,9 +93,56 @@ class HandoverEnv(NsOranEnv):
             logging.debug(f'Action list {action_list}')
         return action_list
 
+    @staticmethod
+    def _parse_positions(file_path: str) -> Dict[int, Tuple[float, float]]:
+        """Parse positions from ns-3 gnuplot files."""
+        positions: Dict[int, Tuple[float, float]] = {}
+        if not os.path.exists(file_path):
+            return positions
+        pattern = re.compile(r'set label\s+"(?P<id>\d+)"\s+at\s+(?P<x>\d+(?:\.\d+)?),(?P<y>\d+(?:\.\d+)?)')
+        with open(file_path, "r") as f:
+            for line in f:
+                m = pattern.search(line)
+                if m:
+                    idx = int(m.group("id"))
+                    positions[idx] = (float(m.group("x")), float(m.group("y")))
+        return positions
+
     def _fill_datalake_usecase(self):
-        # We don't need fill_datalake_usecase in TS use case
-        pass
+        """Populate position tables (ue_positions, gnb_positions) if files exist."""
+        # If base env did not create the tables, just skip
+        if not hasattr(self, "datalake") or "ue_positions" not in self.datalake.tables or "gnb_positions" not in self.datalake.tables:
+            return super()._fill_datalake_usecase()
+
+        sim_path = getattr(self, "sim_path", None)
+        ts = int(getattr(self, "last_timestamp", 0) or 0)
+        if sim_path:
+            ue_pos = self._parse_positions(os.path.join(sim_path, "ues.txt"))
+            gnb_pos = self._parse_positions(os.path.join(sim_path, "enbs.txt"))
+
+            if ue_pos:
+                for ue_id, (x, y) in ue_pos.items():
+                    row = {
+                        "timestamp": ts,
+                        "ueImsiComplete": int(ue_id),
+                        "ue_x": float(x),
+                        "ue_y": float(y),
+                    }
+                    self.datalake.insert_data("ue_positions", row)
+
+            if gnb_pos:
+                for cell_id, (x, y) in gnb_pos.items():
+                    # store cell_id also in ueImsiComplete column to satisfy UNIQUE(timestamp, ueImsiComplete)
+                    row = {
+                        "timestamp": ts,
+                        "ueImsiComplete": int(cell_id),
+                        "cellId": int(cell_id),
+                        "gnb_x": float(x),
+                        "gnb_y": float(y),
+                    }
+                    self.datalake.insert_data("gnb_positions", row)
+
+        return super()._fill_datalake_usecase()
 
     def _get_obs(self) -> list:
         ue_kpms = self.datalake.read_kpms(self.last_timestamp, self.columns_state)                          
@@ -153,8 +203,24 @@ class HandoverEnv(NsOranEnv):
             "loss": "REAL",
             "epsilon": "REAL",
         }
+        # Position tables for GRL/telemetry
+        ue_pos_schema = {
+            "timestamp": "INTEGER",
+            "ueImsiComplete": "INTEGER",
+            "ue_x": "REAL",
+            "ue_y": "REAL",
+        }
+        gnb_pos_schema = {
+            "timestamp": "INTEGER",
+            "ueImsiComplete": "INTEGER",  # kept for UNIQUE constraint
+            "cellId": "INTEGER",
+            "gnb_x": "REAL",
+            "gnb_y": "REAL",
+        }
         self.datalake._create_table(self.REWARD_METRICS_TABLE, reward_metrics_schema)
         self.datalake._create_table(self.TRAINING_METRICS_TABLE, training_metrics_schema)
+        self.datalake._create_table("ue_positions", ue_pos_schema)
+        self.datalake._create_table("gnb_positions", gnb_pos_schema)
         return super()._init_datalake_usecase()
     
     def _compute_reward(self) -> float:
