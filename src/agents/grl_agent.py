@@ -11,15 +11,16 @@ import numpy as np
 import torch
 import torch.nn as nn #Neural network layers.
 import torch.optim as optim #Optimizers.
+# torch_geometric is for GNN, allows representing UE ↔ gNB network as a graph, capturing both node features and edge features
 from torch_geometric.data import Data #Data class for storing graph data.
 from torch_geometric.nn import GATConv #Graph Attention Network layer.
-from torch_geometric.utils import softmax, scatter
+from torch_geometric.utils import softmax, scatter #softmax: Normalizes attention weights to sum to 1. scatter: Aggregates neighbor features.
 
 
 @dataclass
-class GraphTransition:
+class GraphTransition: #needed for replay buffer in DQN training.
     """Container for one graph transition used in replay."""
-    #A single experience: (graph_state, action_vector, reward, next_graph_state, done)
+    #Store one single experience: (graph_state, action_vector, reward, next_graph_state, done)
 
     state: Dict[str, np.ndarray] #graph_state: Dictionary containing UE and gNB features, edge_index, and edge_attr
     action: np.ndarray #action_vector: Array of action indices for each UE
@@ -27,36 +28,42 @@ class GraphTransition:
     next_state: Dict[str, np.ndarray] #next_graph_state: Dictionary containing next UE and gNB features, edge_index, and edge_attr
     done: bool #done: Boolean indicating if the episode is done
 
-
-class EGATConv(nn.Module):
-    """
-    Edge-GAT Convolutional Layer that incorporates edge attributes into attention computation.
-    Extends standard GAT by including edge features in the attention mechanism:
-    e_ij = LeakyReLU(a^T [W·h_i || W·h_j || U·e_ij])
-    """
-    
+# ****************************Edge-aware Graph Attention****************************
+# Standard GATConv only uses node features. Edge attributes are critical for HO decisions.
+# Extends standard GAT by including edge features in the attention mechanism:
+# e_ij = LeakyReLU(a^T [W·h_i || W·h_j || U·e_ij])
+# This preserves edge-specific information (distance, is_serving_cell, sinr_to_gNB)
+# without information loss from aggregation.
+# Each edge's attention weight depends on both node features AND edge features.
+# Use normalized edge attributes
+# h = torch.relu(self.egat1(node_h, edge_index, edge_attr_norm))
+# h = torch.relu(self.egat2(h, edge_index, edge_attr_norm))
+class EGATConv(nn.Module): #EGAT layer updates each node's features by looking at its neighbors, 
+                        #weighting them using attention scores where the attention depends on: node features, target node features, and edge features.
+    # This class defines one GAT layer that takes node features, look at neighbors and outputs new node features
     def __init__(self, in_channels: int, out_channels: int, edge_attr_dim: int, heads: int = 1, 
                  concat: bool = False, negative_slope: float = 0.2, dropout: float = 0.0, 
                  bias: bool = True) -> None:
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.edge_attr_dim = edge_attr_dim
-        self.heads = heads
-        self.concat = concat
-        self.negative_slope = negative_slope
-        self.dropout = dropout
+        self.in_channels = in_channels #size of input node features vector
+        self.out_channels = out_channels #size of output per head
+        self.edge_attr_dim = edge_attr_dim #size of edge vector
+        self.heads = heads #number of attention heads, each head will learn a different attention pattern.
+        self.concat = concat #if True, concatenate heads' outputs instead of averaging.
+        self.negative_slope = negative_slope #slope for LeakyReLU activation, default 0.2, negative inputs are multiplied by 0.2 instead of becoming 0
+        self.dropout = dropout #dropout rate, default 0.0, no dropout
         
+        # --------- Raw features → hidden embeddings ---------
         # Node feature transformation: [in_channels] -> [heads * out_channels]
+        # Why multiply by heads? each head needs its own feature space
         self.lin = nn.Linear(in_channels, heads * out_channels, bias=False)
-        
         # Edge feature transformation: [edge_attr_dim] -> [heads * out_channels]
         self.edge_lin = nn.Linear(edge_attr_dim, heads * out_channels, bias=False)
         
         # Attention mechanism: computes attention weights
-        # Input: [source_node_features || target_node_features || edge_features]
+        # why 3* out_channels? cause: Input: [source_node_features || target_node_features || edge_features]
         # Output: attention score for each head
-        self.att = nn.Parameter(torch.empty(1, heads, 3 * out_channels))
+        self.att = nn.Parameter(torch.empty(1, heads, 3 * out_channels)) #This is the attention vector a
         
         if bias and concat:
             self.bias = nn.Parameter(torch.empty(heads * out_channels))
@@ -99,7 +106,7 @@ class EGATConv(nn.Module):
         row, col = edge_index
         x_i = x[row]  # Source node features [E, heads, out_channels]
         x_j = x[col]  # Target node features [E, heads, out_channels]
-        
+        # Attention score computation
         # Concatenate: [source_features || target_features || edge_features]
         # Shape: [E, heads, 3 * out_channels]
         alpha_input = torch.cat([x_i, x_j, edge_attr_emb], dim=-1)
@@ -108,7 +115,7 @@ class EGATConv(nn.Module):
         alpha = (alpha_input * self.att).sum(dim=-1)  # [E, heads]
         alpha = torch.nn.functional.leaky_relu(alpha, self.negative_slope)
         
-        # Normalize attention weights using softmax
+        # Attention normalization
         alpha = softmax(alpha, row, num_nodes=x.size(0))  # [E, heads]
         
         # Apply dropout to attention weights
@@ -117,11 +124,13 @@ class EGATConv(nn.Module):
         
         # Aggregate neighbor features weighted by attention
         # For each edge, multiply target node features by attention weight
+        # Message passing: each neighbor's message is weighted by attention
         out = x_j * alpha.unsqueeze(-1)  # [E, heads, out_channels]
         
         # Aggregate messages: sum over neighbors for each node
         # Reshape for scatter: [E, heads, out_channels] -> [E, heads * out_channels]
         out_reshaped = out.view(-1, self.heads * self.out_channels)  # [E, heads * out_channels]
+        # Aggregate neighbors. scatter is a PyTorch function that aggregates messages from neighbors to the target node.
         out = scatter(out_reshaped, row, dim=0, dim_size=x.size(0), reduce='add')  # [N, heads * out_channels]
         out = out.view(-1, self.heads, self.out_channels)  # [N, heads, out_channels]
         
@@ -176,7 +185,7 @@ class FeatureNormalizer(nn.Module):
         # Initialize scale: if provided use it, otherwise use 1.0 (will learn)
         if init_scale is not None:
             if init_scale.numel() == 1:
-                init_scale = torch.full((feat_dim,), float(init_scale))
+                init_scale = torch.full((feat_dim,), float(init_scale)) #Expands scalar → vector of length feat_dim
             self.scale = nn.Parameter(init_scale.clone())
         else:
             self.scale = nn.Parameter(torch.ones(feat_dim))
@@ -185,15 +194,12 @@ class FeatureNormalizer(nn.Module):
         if init_shift is not None:
             if init_shift.numel() == 1:
                 init_shift = torch.full((feat_dim,), float(init_shift))
-            self.shift = nn.Parameter(init_shift.clone())
+            self.shift = nn.Parameter(init_shift.clone()) # we declare shift and scale as learnable parameters in nn .
         else:
             self.shift = nn.Parameter(torch.zeros(feat_dim))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Normalize features: (x - shift) / scale
-        """
-        return (x - self.shift) / (self.scale.abs() + self.eps)
+        return (x - self.shift) / (self.scale.abs() + self.eps) #why abs? prevents negative scaling
 
 
 class GraphQNetwork(nn.Module):
@@ -217,17 +223,6 @@ class GraphQNetwork(nn.Module):
         self.ue_encoder = nn.Linear(ue_feat_dim, hidden_dim)
         self.gnb_encoder = nn.Linear(gnb_feat_dim, hidden_dim)
 
-        # Edge attribute encoder (for distance features)
-        # This allows GAT to incorporate edge information (e.g., UE-gNB distance)
-        #self.edge_encoder = nn.Linear(edge_attr_dim, hidden_dim) if edge_attr_dim > 0 else None
-
-        # Two GAT layers; you can deepen this if needed.
-        # Note: Standard GATConv doesn't directly support edge_attr, but we can encode
-        # edge features and add them to node features or use edge features in attention computation
-        # For now, we'll pass edge_attr if GATConv supports it, otherwise encode it separately
-        #self.gat1 = GATConv(hidden_dim, hidden_dim, heads=gat_heads, concat=False)
-        #self.gat2 = GATConv(hidden_dim, hidden_dim, heads=gat_heads, concat=False)
-
         # Two EGAT layers that incorporate edge attributes directly into attention
         # EGAT preserves edge-specific information (distance, is_serving_cell, sinr_to_gNB)
         # without information loss from aggregation
@@ -237,7 +232,7 @@ class GraphQNetwork(nn.Module):
                                heads=gat_heads, concat=False)
 
         # Deeper Q-head: sequential layers for better action value estimation
-        # hidden_dim -> hidden_dim -> num_actions
+        # q_head → MLP maps UE embeddings to Q-values per action.
         self.q_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -386,7 +381,7 @@ class GRLAgent:
         # Set target network to evaluation mode (disables dropout, batch norm updates)
         # In PyTorch, .eval() vs .train() controls behavior (like training=False in TF)
         self.target_net.eval()
-
+        #Adam optimizer updates:GAT weights, Q-head weights, FeatureNormalizer scale & shift
         self.optimizer = optim.Adam(self.online_net.parameters(), lr=self.learning_rate)
         self.loss_fn = nn.MSELoss()
         self.train_step = 0
@@ -441,7 +436,7 @@ class GRLAgent:
                     q[u_idx, masked_action] = float('-inf')
             
             action = torch.argmax(q, dim=1).cpu().numpy().astype(np.int64)
-        return action
+        return action, np.array(action_mask, dtype=np.int64)
 
     # --- Training step ---
     def update(self, buffer: GraphReplayBuffer) -> Optional[float]:

@@ -31,11 +31,15 @@ def main():
     parser.add_argument("--ns3_path", type=str, default="/home/ubadmin/ns3-mmwave-oran", help="Path to ns-3")
     parser.add_argument("--num_steps", type=int, default=500, help="Number of steps to run")
     parser.add_argument("--optimized", action="store_true", help="Enable ns-3 optimized build")
+    # --optimized likely controls: ns-3 build type, Debug vs optimized binaries, Logging verbosity, Runtime performance
+    # This is standard practice for simulation-heavy experiments and reproducibility.
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
     # GRL hyperparameters
     parser.add_argument("--buffer_size", type=int, default=10_000, help="Replay buffer capacity")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for updates") #64
-    parser.add_argument("--train_start", type=int, default=2, help="Steps before training starts") #200
+    parser.add_argument("--train_start", type=int, default=2, help="Steps before training starts, enforces a pure exploration phase.") #200
+    # Why --train_start? The agent does not update weights until: Some interaction history exists, Initial graph states have been observed, 
+    # Random actions have populated the buffer, train_start is a stability guard while buffer.can_sample() is a technical guard
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="Optimizer learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--hidden_dim", type=int, default=128, help="Hidden dim for GAT/heads")
@@ -76,8 +80,13 @@ def main():
     print(f"Sample gNB features (first gNB): {obs['gnb_features'][0]}")
     print("=" * 40 + "\n")
 
-    # Initialize normalization with sample statistics for immediate normalization
+    # Initialize adaptive normalization (not static) with sample statistics for immediate normalization
     # Collect a few samples to estimate mean and std
+    # Normalization parameters are: Learnable and Initialized using sample statistics
+    # This is more robust than fixed normalization.
+    # Why do we collect samples before training? Estimate reasonable initial statistics for normalization to avoid exploding gradients.
+    # Without this sampling, normalization layers would start with: mean = 0, std = 1, but your real data might look like: UE RSRP mean ≈ -90,
+    #  gNB load mean ≈ 0.6, Edge distance mean ≈ 120. So the first forward pass would produce very large activations, especially inside attention layers.
     sample_obs = [obs]
     for _ in range(min(5, args.train_start)):
         action = env.action_space.sample()
@@ -91,6 +100,8 @@ def main():
     edge_samples = np.concatenate([o['edge_attr'] for o in sample_obs], axis=0)
     
     # Initialize with mean and std (standard normalization: (x - mean) / std)
+    # This initializes learnable normalization layers inside the network. Think of it as: Start normalization 
+    # close to reality instead of guessing.
     ue_mean = torch.tensor(ue_samples.mean(axis=0), dtype=torch.float32)
     ue_std = torch.tensor(ue_samples.std(axis=0), dtype=torch.float32) + 1e-8  # Add small epsilon
     gnb_mean = torch.tensor(gnb_samples.mean(axis=0), dtype=torch.float32)
@@ -118,6 +129,7 @@ def main():
     ue_tensor = torch.as_tensor(obs['ue_features'], dtype=torch.float32)
     gnb_tensor = torch.as_tensor(obs['gnb_features'], dtype=torch.float32)
     edge_tensor = torch.as_tensor(obs['edge_attr'], dtype=torch.float32)
+    # Applies normalization layers inside the network.
     ue_norm, gnb_norm, edge_norm = agent.online_net.normalize_features(ue_tensor, gnb_tensor, edge_tensor)
     print_normalization_comparison(obs['ue_features'], obs['gnb_features'], obs['edge_attr'],
                                   ue_norm.detach().cpu().numpy(),
@@ -129,8 +141,8 @@ def main():
     print("Environment ready, starting training loop\n")
 
     for step in range(1, args.num_steps + 1):
-        #print(f"Observations: {obs}")
-        action, action_mask= agent.select_action(obs)
+        #Mask indicates valid gNBs per UE
+        action, action_mask = agent.select_action(obs)
         next_obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 
@@ -140,7 +152,7 @@ def main():
         if step >= args.train_start and buffer.can_sample():
             loss = agent.update(buffer)
             if loss is not None:
-                env.log_training_metrics(step=step, loss=loss, epsilon=agent.epsilon)
+                env.log_training_metrics(step=step, reward_value=reward, loss=loss, epsilon=agent.epsilon)
 
         # Logging for visibility
         buffer_size = len(buffer)

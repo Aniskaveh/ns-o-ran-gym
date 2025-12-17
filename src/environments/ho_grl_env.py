@@ -1,3 +1,5 @@
+"""Gym-compatible environment wrapping ns-O-RAN for Graph-based RL (GAT encoder + DQN head)."""
+
 from __future__ import annotations
 from typing_extensions import override
 from typing import Dict, Tuple, List, Any
@@ -13,14 +15,13 @@ import math
 class HandoverGRLEnv(NsOranEnv):
     """Scenario-ten environment with reward/training telemetry hooks."""
 
-    REWARD_METRICS_TABLE = "ho_reward_metrics"
-    TRAINING_METRICS_TABLE = "ho_training_metrics"
-
     def __init__(self,ns3_path: str,scenario_configuration: dict,output_folder: str,
                 optimized: bool,verbose: bool = False,time_factor: float = 0.001,
                 Cf: float = 1.0,lambdaf: float = 0.1,):
-        """Environment mirroring TS behaviour but reserved for DQN-based HO."""
-
+        # Cf: Cost factor for handovers.
+        # lambdaf: Decay factor for handover cost.
+        # time_factor: Time factor for the environment.
+        # Calls base class initializer and sets up the environment.
         super().__init__(ns3_path=ns3_path, scenario="scenario-ten", 
                         scenario_configuration=scenario_configuration,
                         output_folder=output_folder,optimized=optimized, 
@@ -28,7 +29,6 @@ class HandoverGRLEnv(NsOranEnv):
                         log_file="HoActions.txt",control_file="ho_actions_for_ns3.csv",)
         # These features can be hardcoded since they are specific for the use case
         # UE features: position (from ue_positions), serving SINR, throughput, buffer size, top 3 neighbor SINRs (from gnb_cu_cp and du)
-        # Note: Positions and KPMs are read separately and merged in _get_obs()
         # We also need neighbor IDs to map SINRs to specific gNBs for edge attributes
         self.columns_state_ue = ["ue_x", "ue_y", 
                                 "L3 serving SINR", "L3 serving Id(m_cellId)",
@@ -37,7 +37,6 @@ class HandoverGRLEnv(NsOranEnv):
                                 "L3 neigh SINR 2", "L3 neigh Id 2 (cellId)",
                                 "L3 neigh SINR 3", "L3 neigh Id 3 (cellId)"]
         # gNB features: position (from gnb_positions), numActiveUes (from gnb_cu_cp, aggregated), PRB metrics (from du, aggregated)
-        # Note: Positions and metrics are read separately and aggregated in _get_obs()
         self.columns_state_gnb = ["gnb_x", "gnb_y",
                                   "numActiveUes", "RRU.PrbUsedDl", "dlAvailablePrbs"]
         # We need the throughput as well as the cell id to determine whether a handover occurred
@@ -55,16 +54,16 @@ class HandoverGRLEnv(NsOranEnv):
                 "gnb_ids": spaces.Box(low=2, high=8, shape=(n_gnbs,), dtype=np.int32),  # CellIds corresponding to gNB indices
             })
 
-        # Scenario-one has seven gNBs. Each UE can select one gNB (offset of two) or stay put
+        # Scenario-ten has seven gNBs. Each UE can select one gNB (offset of two) or stay put (action 0)
         n_gnbs = 7
         n_actions_ue = n_gnbs+1
 
         # obs_space size: (# ues_per_gnb * # n_gnbs, # observation_columns + timestamp = 1)
         self.action_space = spaces.MultiDiscrete([n_actions_ue] * self.scenario_configuration["ues"] * n_gnbs)
-
+        # Used for tracking previous KPI snapshots for reward calculation.
         self.previous_df = None
         self.previous_kpms = None
-        self.handovers_dict = dict()
+        self.handovers_dict = dict() #stores last HO timestamp per UE for cost computation.
         self.verbose = verbose
         if self.verbose:
             logging.basicConfig(filename="./reward_ho.log",level=logging.DEBUG,
@@ -77,6 +76,7 @@ class HandoverGRLEnv(NsOranEnv):
     def _compute_action(self, action) -> list[tuple]:
         # action from multidiscrete shall become a list of ueId, targetCell.
         # If a targetCell is 0, it means No Handover, thus we don't send it
+        # Converts Gym action vector → ns-O-RAN HO commands.
         action_list = []
         for ueId, targetCellId in enumerate(action):
             if targetCellId != 0: # and 
@@ -86,6 +86,7 @@ class HandoverGRLEnv(NsOranEnv):
             logging.debug(f'Action list {action_list}')
         return action_list
 
+    # Parses positions from ns-3 gnuplot files. Returns {id: (x, y)}.
     @staticmethod
     def _parse_positions(file_path: str) -> Dict[int, Tuple[float, float]]:
         """Parse positions from ns-3 gnuplot files."""
@@ -137,17 +138,67 @@ class HandoverGRLEnv(NsOranEnv):
 
         return super()._fill_datalake_usecase()
 
+    def log_training_metrics(self, step: int, reward_value: float,loss: float, epsilon: float) -> None:
+        if not hasattr(self, "datalake") or "ho_reward_metrics" not in self.datalake.tables:
+            return
+
+        timestamp = int(getattr(self, "last_timestamp", 0) or 0)
+        db_row = {
+            "timestamp": timestamp,
+            "ueImsiComplete": int(step),
+            "step": int(step),
+            "reward": float(reward_value),
+            "loss": float(loss),
+            "epsilon": float(epsilon),
+        }
+        self.datalake.insert_data("ho_training_metrics", db_row)
+
+    @override
+    def _init_datalake_usecase(self):
+        training_metrics_schema = {
+            "timestamp": "INTEGER",
+            "ueImsiComplete": "INTEGER",
+            "step": "INTEGER",
+            "reward": "REAL",
+            "loss": "REAL",
+            "epsilon": "REAL",
+        }
+        # Position tables for GRL/telemetry
+        ue_pos_schema = {
+            "timestamp": "INTEGER",
+            "ueImsiComplete": "INTEGER",
+            "ue_x": "REAL",
+            "ue_y": "REAL",
+        }
+        gnb_pos_schema = {
+            "timestamp": "INTEGER",
+            "ueImsiComplete": "INTEGER",  # kept for UNIQUE constraint
+            "cellId": "INTEGER",
+            "gnb_x": "REAL",
+            "gnb_y": "REAL",
+        }
+        self.datalake._create_table("ho_training_metrics", training_metrics_schema)
+        self.datalake._create_table("ue_positions", ue_pos_schema)
+        self.datalake._create_table("gnb_positions", gnb_pos_schema)
+        return super()._init_datalake_usecase()
+
     def _get_obs(self) -> list:
         n_gnbs = 7
         n_ue = self.scenario_configuration["ues"] * n_gnbs
         ue_rows = self.datalake.read_kpms(self.last_timestamp,self.columns_state_ue) or []
         gnb_rows = self.datalake.read_kpms(self.last_timestamp,self.columns_state_gnb) or []
 
+        # What are ue_dict and ue_feats? 
+        # ue_dict is a dictionary that holds all UE raw data, keyed by UE ID like: 
+        # {ue_id: {x: float, y: float, ...}} while ue_feats is a list of lists that 
+        # holds the UE features for each UE like: [[x, y, sinr, ...]],ready for ML input.
+        # Initializes a dict to hold all UE data, keyed by UE ID
         ue_dict: Dict[int, Dict[str, float]] = {}
         for r in ue_rows:
             ue_id = int(r[0])
-            # Build a mapping of cellId -> SINR for this UE's neighbors
-            neigh_sinr_map: Dict[int, float] = {}
+            # According to the columns_state_ue, Columns [7, 8], [9, 10], [11, 12] correspond to up to 3 
+            # neighboring cells and their SINRs. like: [SINR, cellId]
+            neigh_sinr_map: Dict[int, float] = {} #Creates a dictionary: {neighbor_cell_id: SINR} mapping of neighbor_cellId -> SINR for this UE's neighbors
             if len(r) > 7 and r[7] is not None and r[8] is not None:
                 cell_id = int(r[8])
                 sinr_val = float(r[7])
@@ -163,6 +214,7 @@ class HandoverGRLEnv(NsOranEnv):
                 sinr_val = float(r[11])
                 if cell_id > 0:
                     neigh_sinr_map[cell_id] = sinr_val
+            # So neigh_sinr_map can be like: {2: 15.0, 3: 10.0, 4: 8.0}
             
             ue_dict[ue_id] = {
                 "x": float(r[1]) if r[1] is not None else 0.0,
@@ -176,7 +228,8 @@ class HandoverGRLEnv(NsOranEnv):
                 "neigh_sinr3": float(r[11]) if len(r) > 11 and r[11] is not None else 0.0,
                 "neigh_sinr_map": neigh_sinr_map,  # Map cellId -> SINR for edge attributes
             }
-        gnb_dict: Dict[int, Dict[str, float]] = {}
+        # Initializes a dict to hold all gnb data, keyed by gnb ID
+        gnb_dict: Dict[int, Dict[str, float]] = {} #Creates a dictionary: {gnb_id: {x: float, y: float, numActiveUes: float, prb_usage: float, avail_prbs: float}}
         for r in gnb_rows:
             cid = int(r[0])
             gnb_dict[cid] = {
@@ -199,15 +252,15 @@ class HandoverGRLEnv(NsOranEnv):
         for cid in gnb_dict.keys():
             gnb_dict[cid]["numActiveUes"] = float(cell_ue_count.get(cid, 0))
 
-        ue_ids = sorted(ue_dict.keys())[:n_ue] or list(range(n_ue))
-        # Keep only NR gNBs (labels 2–8 in enbs.txt), drop LTE anchor (1).
+        ue_ids = sorted(ue_dict.keys())[:n_ue] or list(range(n_ue)) #ensures only first n_ue UEs are used
+        # Keep only NR gNBs (labels 2–8 in enbs.txt), drop LTE anchor (1). #Only considers gNBs 2-8 for handover decisions
         gnb_ids = [cid for cid in sorted(gnb_dict.keys()) if cid >= 2][:n_gnbs]
         if not gnb_ids:
             gnb_ids = list(range(2, 2 + n_gnbs))  # fallback to 2..8
 
         # Build UE feature vectors: [x, y, serving_sinr, throughput, buffer, neigh_sinr1, neigh_sinr2, neigh_sinr3]
         ue_feats: List[List[float]] = []
-        serving_cells: List[int] = []
+        serving_cells: List[int] = [] #keeps track of the gNB each UE is connected to
         for uid in ue_ids:
             u = ue_dict.get(uid, {})
             ue_feats.append([
@@ -221,7 +274,7 @@ class HandoverGRLEnv(NsOranEnv):
                 u.get("neigh_sinr3", 0.0),
             ])
             serving_cells.append(int(u.get("serv_cell", -1)))
-        # pad/truncate UE features to fixed n_ue
+        # pad/truncate UE features to fixed n_ue. Ensures fixed matrix shape, necessary for ML input.
         while len(ue_feats) < n_ue:
             ue_feats.append([0.0] * len(self.columns_state_ue))  # 8 features per UE
             serving_cells.append(-1)
@@ -239,11 +292,14 @@ class HandoverGRLEnv(NsOranEnv):
                 g.get("prb_usage", 0.0),
                 g.get("avail_prbs", 0.0),
             ])
-        # pad/truncate gNB features to fixed n_gnb
+        # pad/truncate gNB features to fixed n_gnb, Ensures fixed matrix shape, necessary for ML input.
         while len(gnb_feats) < n_gnbs:
             gnb_feats.append([0.0] * len(self.columns_state_gnb))  # 5 features per gNB
         gnb_feats = gnb_feats[:n_gnbs]
 
+        # Goal is to create a graph with UEs as nodes and gNBs as edges.
+        # Nodes: UEs (indices 0…n_ue-1), gNBs (indices n_ue…n_ue+n_gnbs-1)
+        # Edges: UEs → gNBs (connect each UE to every gNB)
         edges_src: List[int] = []
         edges_dst: List[int] = []
         edge_attr: List[List[float]] = []
@@ -252,7 +308,8 @@ class HandoverGRLEnv(NsOranEnv):
             ue_data = ue_dict.get(ue_id, {}) if ue_id is not None else {}
             ux, uy = u_feat[0], u_feat[1]
             serv_cell = serving_cells[u_idx] if u_idx < len(serving_cells) else -1
-            
+            # g_offset = index of the gNB in the gNB list (0…n_gnbs-1)
+            # n_ue + g_offset → shifts gNB indices after all UE nodes
             for g_offset in range(n_gnbs):
                 gid = gnb_ids[g_offset] if g_offset < len(gnb_ids) else (2 + g_offset)
                 gx, gy = gnb_feats[g_offset][0], gnb_feats[g_offset][1]
@@ -269,7 +326,7 @@ class HandoverGRLEnv(NsOranEnv):
                 # Use -100.0 dB as default to indicate "no measurement" (distinct from poor SINR like -5 dB)
                 sinr_to_gNB = neigh_sinr_map.get(gid, -100.0)
                 
-                # If gNB is serving cell, use serving SINR instead (can be negative, that's normal)
+                # If gNB is serving cell, use serving SINR instead
                 if is_serving > 0.5:
                     sinr_to_gNB = ue_data.get("sinr", -100.0)
                 
@@ -309,84 +366,17 @@ class HandoverGRLEnv(NsOranEnv):
         }
 
         return self.observations
-
-    def _log_reward_metrics(self, reward_value: float) -> None:
-        """Persist per-step reward so Grafana can read it from the datalake."""
-        if not hasattr(self, "datalake") or self.REWARD_METRICS_TABLE not in self.datalake.tables:
-            return
-
-        timestamp = int(getattr(self, "last_timestamp", 0) or 0)
-        self.reward_step += 1
-        db_row = {
-            "timestamp": timestamp,
-            "ueImsiComplete": self.reward_step,
-            "step": self.reward_step,
-            "reward": float(reward_value),
-        }
-        self.datalake.insert_data(self.REWARD_METRICS_TABLE, db_row)
-
-    def log_training_metrics(self, step: int, loss: float, epsilon: float) -> None:
-        """Record DQN training telemetry (loss + epsilon) for Grafana dashboards."""
-        if not hasattr(self, "datalake") or self.TRAINING_METRICS_TABLE not in self.datalake.tables:
-            return
-
-        timestamp = int(getattr(self, "last_timestamp", 0) or 0)
-        db_row = {
-            "timestamp": timestamp,
-            "ueImsiComplete": int(step),
-            "step": int(step),
-            "loss": float(loss),
-            "epsilon": float(epsilon),
-        }
-        self.datalake.insert_data(self.TRAINING_METRICS_TABLE, db_row)
-
-    @override
-    def _init_datalake_usecase(self):
-        reward_metrics_schema = {
-            "timestamp": "INTEGER",
-            "ueImsiComplete": "INTEGER",
-            "step": "INTEGER",
-            "reward": "REAL",
-        }
-        training_metrics_schema = {
-            "timestamp": "INTEGER",
-            "ueImsiComplete": "INTEGER",
-            "step": "INTEGER",
-            "loss": "REAL",
-            "epsilon": "REAL",
-        }
-        # Position tables for GRL/telemetry
-        ue_pos_schema = {
-            "timestamp": "INTEGER",
-            "ueImsiComplete": "INTEGER",
-            "ue_x": "REAL",
-            "ue_y": "REAL",
-        }
-        gnb_pos_schema = {
-            "timestamp": "INTEGER",
-            "ueImsiComplete": "INTEGER",  # kept for UNIQUE constraint
-            "cellId": "INTEGER",
-            "gnb_x": "REAL",
-            "gnb_y": "REAL",
-        }
-        self.datalake._create_table(self.REWARD_METRICS_TABLE, reward_metrics_schema)
-        self.datalake._create_table(self.TRAINING_METRICS_TABLE, training_metrics_schema)
-        self.datalake._create_table("ue_positions", ue_pos_schema)
-        self.datalake._create_table("gnb_positions", gnb_pos_schema)
-        return super()._init_datalake_usecase()
     
     def _compute_reward(self) -> float:
-        # Computes the reward for the traffic steering environment. Based off journal on TS
-        # The total reward is the sum of per ue rewards, calculated as the difference in the
-        # logarithmic throughput between indication periodicities. If an UE experienced an HO,
-        # its reward takes into account a cost function related to said handover. The cost
-        # function punishes frequent handovers.
-        # See the docs for more info.
-
+        # Reward is per-UE, summed to get a total reward
+        # Uses logarithmic difference in throughput and handover cost
+        # Reward = Log(new_throughput) - Log(old_throughput) - HandoverCost
         total_reward = 0.0
         current_kpms = self.datalake.read_kpms(self.last_timestamp, self.columns_reward)
 
         # If this is the first iteration we do not have the previous kpms
+        # So it tries to fetch KPIs from one indication period ago.
+        # This is needed because reward is based on change in throughput over time
         if self.previous_kpms is None:
             if self.verbose:
                 logging.debug(f'Starting first reward computation at timestamp {self.last_timestamp}')
@@ -400,7 +390,6 @@ class HandoverGRLEnv(NsOranEnv):
             self.previous_kpms = current_kpms if current_kpms is not None else []
             self.previous_timestamp = self.last_timestamp
             self.reward = 0.0
-            self._log_reward_metrics(self.reward)
             return self.reward
 
         # Safety check: if either list is empty, return zero reward
@@ -410,15 +399,14 @@ class HandoverGRLEnv(NsOranEnv):
             self.previous_kpms = current_kpms if len(current_kpms) > 0 else []
             self.previous_timestamp = self.last_timestamp
             self.reward = 0.0
-            self._log_reward_metrics(self.reward)
             return self.reward
 
-        #Assuming they are of the same lenght
+        #Assuming both current and previous lists are of the same lenght and same UE order.
         for t_o, t_n in zip(self.previous_kpms, current_kpms):
             ueImsi_o, ueThpDl_o, sourceCell = t_o
             ueImsi_n, ueThpDl_n, currentCell = t_n
-            if ueImsi_n == ueImsi_o:
-                HoCost = 0
+            if ueImsi_n == ueImsi_o: #ensures same UE is being compared
+                HoCost = 0 #penalizes frequent handovers, Formula: HoCost = Cf * ((1 - lambdaf) ** timeDiff)
                 if currentCell != sourceCell:
                     lastHo = self.handovers_dict.get(ueImsi_n, 0)  # Retrieve last handover time or default to 0
                     if lastHo != 0: # If this is the first HO the cost is 0
@@ -446,5 +434,4 @@ class HandoverGRLEnv(NsOranEnv):
         self.previous_kpms = current_kpms
         self.previous_timestamp = self.last_timestamp
         self.reward = total_reward
-        self._log_reward_metrics(self.reward)
         return self.reward
